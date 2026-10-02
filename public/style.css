@@ -238,3 +238,31 @@ td.added.num, th.added.num { color: #2e7d4f; }
 .print-page-item:hover { background: #f2efe7; }
 .print-page-item.active { border-color: var(--primary); background: #eef3fa; }
 .print-page-item .icon-btn { position: absolute; right: 8px; top: 8px; }
+
+/* ============ 玻璃裁片 ============ */
+.color-chip {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+.cut-color-summary { margin: 10px 0; }
+.cut-sheets { display: flex; flex-direction: column; gap: 14px; margin-top: 10px; }
+.cut-sheets h3 { margin: 6px 0 2px; font-size: 14px; }
+.cut-sheet-card {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff;
+}
+.cut-sheet-card .bar-title { font-weight: 600; margin-bottom: 6px; }
+.cut-sheet-svg {
+  display: block;
+  margin: 6px 0 8px;
+  border: 1px dashed #ccc;
+  border-radius: 4px;
+  background: #fff;
+}

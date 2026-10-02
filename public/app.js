@@ -710,15 +710,18 @@ function switchTab(which) {
   document.getElementById('tabDiff').classList.toggle('active', which === 'diff');
   document.getElementById('tabPrint').classList.toggle('active', which === 'print');
   document.getElementById('tabProduction').classList.toggle('active', which === 'production');
+  document.getElementById('tabCutting').classList.toggle('active', which === 'cutting');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
   document.getElementById('viewPrint').hidden = which !== 'print';
   document.getElementById('viewProduction').hidden = which !== 'production';
+  document.getElementById('viewCutting').hidden = which !== 'cutting';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
   if (which === 'production') enterProduction();
+  if (which === 'cutting') enterCutting();
 }
 
 (async function init() {
@@ -1633,3 +1636,349 @@ function renderPrintCanvas() {
 document.getElementById('printDesignSelect').addEventListener('change', loadPrintVersions);
 document.getElementById('btnPrintPreview').addEventListener('click', runPrintPreview);
 document.getElementById('btnPrintDownloadAll').addEventListener('click', downloadAllSvgs);
+
+// ================= 玻璃裁片（彩色原片排样） =================
+
+const cut = {
+  sheets: [],
+  designs: [],
+  publications: [],
+  orders: [],
+  detailId: null,
+};
+
+function cutBanner(kind, msg) {
+  const b = document.getElementById('cutBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.textContent = msg;
+  clearTimeout(cutBanner._t);
+  if (kind === 'success') cutBanner._t = setTimeout(() => { b.hidden = true; }, 3000);
+}
+
+async function enterCutting() {
+  cutBanner(false);
+  await Promise.all([loadGlassSheets(), refreshCutDesigns(), loadCutOrders()]);
+}
+
+// ---------- 原片库存 ----------
+
+async function loadGlassSheets() {
+  const data = await api('GET', '/api/glass-sheets');
+  cut.sheets = data.sheets;
+  renderGlassList();
+}
+
+function renderGlassList() {
+  const el = document.getElementById('glassList');
+  if (!cut.sheets.length) {
+    el.innerHTML = '<div class="hint">尚未登记颜色原片。每种颜色仅可登记一种宽×高规格。</div>';
+    return;
+  }
+  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  for (const s of cut.sheets) {
+    html += `<tr>
+      <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
+      <td class="num">${s.width}×${s.height}</td>
+      <td class="num">${s.stock}</td>
+      <td class="num">${s.reserved}</td>
+      <td class="num"><b>${s.available}</b></td>
+      <td><input type="number" min="0" step="1" value="${s.stock}" class="glass-stock" data-id="${s.id}" style="width:72px"></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+  el.querySelectorAll('.glass-stock').forEach((inp) => {
+    inp.addEventListener('change', () => updateGlassStock(Number(inp.dataset.id), Number(inp.value)));
+  });
+}
+
+async function addGlassSheet() {
+  const msg = document.getElementById('glassMsg');
+  const body = {
+    color: document.getElementById('glassColor').value,
+    width: Number(document.getElementById('glassWidth').value),
+    height: Number(document.getElementById('glassHeight').value),
+    stock: Number(document.getElementById('glassStock').value),
+  };
+  try {
+    await api('POST', '/api/glass-sheets', body);
+    msg.textContent = '✓ 已登记';
+    await loadGlassSheets();
+  } catch (err) { msg.textContent = '⛔ ' + err.message; }
+}
+
+async function updateGlassStock(id, stock) {
+  const msg = document.getElementById('glassMsg');
+  if (!Number.isInteger(stock) || stock < 0) {
+    msg.textContent = '⛔ 库存张数必须是非负整数，输入已忽略';
+    await loadGlassSheets();
+    return;
+  }
+  try {
+    await api('PATCH', `/api/glass-sheets/${id}`, { stock });
+    msg.textContent = '✓ 库存已更新';
+    await Promise.all([loadGlassSheets(), loadCutOrders()]);
+  } catch (err) {
+    msg.textContent = '⛔ ' + err.message;
+    await loadGlassSheets();
+  }
+}
+
+// ---------- 图纸/版本 ----------
+
+async function refreshCutDesigns() {
+  const data = await api('GET', '/api/designs');
+  cut.designs = data.designs;
+  const sel = document.getElementById('cutDesignSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const d of cut.designs) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = d.latest_version
+      ? `${d.name}（最新 v${d.latest_version}）`
+      : `${d.name}（暂无发布版）`;
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  await loadCutVersions();
+}
+
+async function loadCutVersions() {
+  const sel = document.getElementById('cutVersionSelect');
+  sel.innerHTML = '';
+  cut.publications = [];
+  const id = Number(document.getElementById('cutDesignSelect').value);
+  if (!id) { sel.innerHTML = '<option value="">（请先选择图纸）</option>'; return; }
+  const data = await api('GET', `/api/designs/${id}/publications`);
+  cut.publications = data.publications;
+  if (!data.publications.length) { sel.innerHTML = '<option value="">（该图纸暂无发布版）</option>'; return; }
+  for (const p of data.publications) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = `v${p.version} · ${p.publishedAt}`;
+    sel.appendChild(opt);
+  }
+}
+
+function cutInput() {
+  return {
+    publicationId: Number(document.getElementById('cutVersionSelect').value),
+    copies: Number(document.getElementById('cutCopies').value),
+    gap: Number(document.getElementById('cutGap').value),
+  };
+}
+
+// ---------- 预览 ----------
+
+async function previewCutOrder() {
+  const body = cutInput();
+  if (!body.publicationId) { showCutHint('请先发布图纸，再选择发布版本。'); return; }
+  try {
+    const data = await api('POST', '/api/cut-orders/preview', body);
+    cut.detailId = null;
+    renderCutDetail({ preview: data.preview });
+    cutBanner(false);
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.code === 'piece_too_large') txt += `（拼片 #${d.pieceNo} 外接 ${d.pieceWidth}×${d.pieceHeight} mm，原片 ${d.sheetWidth}×${d.sheetHeight} mm）`;
+    cutBanner('error', txt);
+    showCutHint(txt.replace('⛔ ', ''));
+  }
+}
+
+function showCutHint(text) {
+  document.getElementById('cutPreviewContent').innerHTML = `<div class="hint">${escapeHtml(text)}</div>`;
+}
+
+function cutStockBadge(p, isPreview) {
+  if (isPreview || p.status === 'draft') {
+    if (p.totalShortage > 0) {
+      const detail = p.colors.filter((c) => c.shortage > 0)
+        .map((c) => `${c.color} 需 ${c.requiredSheets}/可用 ${c.available}（缺 ${c.shortage}）`).join('；');
+      return `<div class="stock-badge bad">⚠ 库存缺口：${escapeHtml(detail)} —— 不能确认</div>`;
+    }
+    return `<div class="stock-badge ok">✓ 各色原片库存充足（共 ${p.totalSheets} 张；预览不占库存）</div>`;
+  }
+  return `<div class="stock-badge ${p.status === 'confirmed' ? 'ok' : 'cancel'}">
+    ${p.status === 'confirmed' ? '✓ 已确认（各色所需原片已原子预留）' : '已取消（预留已释放）'}</div>`;
+}
+
+// mode: { preview: obj } 或 { order: obj }
+function renderCutDetail(mode) {
+  const isPreview = !!mode.preview;
+  const p = isPreview ? mode.preview : mode.order;
+  let html = '';
+
+  html += `<div class="plan-head">
+    <div><b>${isPreview ? '排样预览（不落库、不占库存）' : `裁片订单 #${p.id} · ${escapeHtml(p.name)}`}</b></div>
+    <div class="muted">发布版 v${p.version} · ${p.copies} 件 · 片间最小间距 ${p.gap} mm ·
+      总裁片数 <b>${p.totalSheets}</b> / ${p.maxSheets} 张</div></div>`;
+  html += cutStockBadge(p, isPreview);
+
+  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
+  for (const c of p.colors) {
+    html += `<tr>
+      <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
+      <td class="num">${c.sheetWidth}×${c.sheetHeight}</td>
+      <td class="num"><b>${c.requiredSheets}</b></td>
+      <td class="num">${c.stock}</td>
+      <td class="num">${c.reserved}</td>
+      <td class="num">${c.available}</td>
+      <td class="num">${c.shortage > 0 ? `<span class="gap-info">${c.shortage}</span>` : 0}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  // 逐张原片
+  html += '<div class="cut-sheets">';
+  for (const c of p.layout.colors) {
+    html += `<h3><span class="color-chip" style="background:${c.color}"></span>${c.color} · ${c.sheetWidth}×${c.sheetHeight} mm · ${c.sheets.length} 张</h3>`;
+    for (const sheet of c.sheets) {
+      html += `<div class="cut-sheet-card">
+        <div class="bar-title">原片 #${sheet.index}（${sheet.width}×${sheet.height} mm）· ${sheet.placements.length} 片</div>
+        ${sheetSvg(sheet, c.color)}
+        <table><thead><tr><th>片号</th><th>件次</th><th class="num">旋转</th><th class="num">x,y</th><th class="num">外接宽×高</th></tr></thead><tbody>`;
+      for (const q of sheet.placements) {
+        html += `<tr><td>#${q.pieceNo}</td><td>第 ${q.copy} 件</td>
+          <td class="num">${q.rotation}°</td><td class="num">${q.x}, ${q.y}</td>
+          <td class="num muted">${q.width}×${q.height}</td></tr>`;
+      }
+      html += '</tbody></table></div>';
+    }
+  }
+  html += '</div>';
+
+  if (isPreview) {
+    html += '<div class="btn-row"><button id="btnCutSave" class="primary">存为草稿订单</button></div>';
+  } else if (p.status === 'draft') {
+    html += `<div class="btn-row">
+      <button id="btnCutConfirm" class="primary">确认订单（预留 ${p.totalSheets} 张）</button>
+      <button id="btnCutDelete" class="danger">删除草稿</button></div>`;
+  } else if (p.status === 'confirmed') {
+    html += '<div class="btn-row"><button id="btnCutCancel" class="danger">取消订单（释放预留）</button></div>';
+  }
+
+  document.getElementById('cutPreviewContent').innerHTML = html;
+
+  const save = document.getElementById('btnCutSave');
+  if (save) save.addEventListener('click', () => saveCutDraft(mode.preview));
+  const cf = document.getElementById('btnCutConfirm');
+  if (cf) cf.addEventListener('click', () => confirmCutOrder(p.id));
+  const de = document.getElementById('btnCutDelete');
+  if (de) de.addEventListener('click', () => deleteCutOrder(p.id));
+  const ca = document.getElementById('btnCutCancel');
+  if (ca) ca.addEventListener('click', () => cancelCutOrder(p.id));
+}
+
+// 单张原片排样示意 SVG：viewBox 取原片毫米尺寸，y 轴翻转（屏幕坐标向下）
+function sheetSvg(sheet, fallbackColor) {
+  const W = sheet.width, H = sheet.height;
+  const maxW = 340;
+  const cssW = Math.min(maxW, W * 0.8);
+  return `<svg class="cut-sheet-svg" width="${cssW}" height="${cssW * H / W}" viewBox="0 0 ${W} ${H}"
+    preserveAspectRatio="xMidYMid meet">
+    <rect x="0" y="0" width="${W}" height="${H}" fill="#fbfaf7" stroke="#222" stroke-width="${Math.max(W, H) * 0.008}"/>
+    ${sheet.placements.map((q) => {
+      const pts = q.polygon.map(([x, y]) => `${x},${H - y}`).join(' ');
+      return `<polygon points="${pts}" fill="${q.color || fallbackColor}" fill-opacity="0.72"
+        stroke="#333" stroke-width="${Math.max(W, H) * 0.004}"/>`;
+    }).join('')}
+  </svg>`;
+}
+
+// ---------- 建单 / 确认 / 取消 / 删除 / 列表 ----------
+
+async function saveCutDraft(preview) {
+  const name = document.getElementById('cutName').value;
+  try {
+    const data = await api('POST', '/api/cut-orders', {
+      name: name || undefined,
+      publicationId: preview.publicationId,
+      copies: preview.copies,
+      gap: preview.gap,
+    });
+    cutBanner('success', `✓ 已存为草稿订单 #${data.order.id}（尚未占用库存）`);
+    await loadCutOrders(data.order.id);
+  } catch (err) { cutBanner('error', '⛔ ' + err.message); }
+}
+
+async function confirmCutOrder(id) {
+  try {
+    const data = await api('POST', `/api/cut-orders/${id}/confirm`);
+    cutBanner('success', `✓ 订单 #${id} 已确认，预留 ${data.order.totalSheets} 张原片`);
+    await loadGlassSheets();
+    await loadCutOrders(id);
+  } catch (err) {
+    cutBanner('error', '⛔ ' + (err.data?.error || err.message));
+    await loadGlassSheets();
+    await loadCutOrders(id);
+  }
+}
+
+async function cancelCutOrder(id) {
+  if (!confirm(`确定取消订单 #${id}？已预留的各色原片将一次性释放。`)) return;
+  try {
+    const data = await api('POST', `/api/cut-orders/${id}/cancel`);
+    cutBanner('success', `订单 #${id} 已取消，释放 ${data.order.totalSheets} 张`);
+    await loadGlassSheets();
+    await loadCutOrders(id);
+  } catch (err) { cutBanner('error', '⛔ ' + err.message); await loadCutOrders(id); }
+}
+
+async function deleteCutOrder(id) {
+  if (!confirm(`确定删除草稿订单 #${id}？`)) return;
+  try {
+    await api('DELETE', `/api/cut-orders/${id}`);
+    cutBanner('success', `草稿 #${id} 已删除`);
+    cut.detailId = null;
+    showCutHint('草稿已删除。');
+    await loadCutOrders();
+  } catch (err) { cutBanner('error', '⛔ ' + err.message); }
+}
+
+async function loadCutOrders(selectId) {
+  const data = await api('GET', '/api/cut-orders');
+  cut.orders = data.orders;
+  renderCutOrderList();
+  if (selectId) {
+    const o = cut.orders.find((x) => x.id === selectId);
+    if (o) { cut.detailId = o.id; renderCutDetail({ order: o }); }
+  }
+}
+
+function renderCutOrderList() {
+  const el = document.getElementById('cutOrderList');
+  if (!cut.orders.length) { el.innerHTML = '<div class="hint">暂无订单。</div>'; return; }
+  el.innerHTML = cut.orders.map((o) => {
+    const badge = o.status === 'confirmed'
+      ? '<span class="badge ok">已确认</span>'
+      : o.status === 'canceled'
+        ? '<span class="badge" style="background:#eee;color:#888">已取消</span>'
+        : '<span class="badge bad">草稿</span>';
+    const colors = o.colors.map((c) =>
+      `<span class="color-chip" style="background:${c.color}" title="${c.color} ×${c.requiredSheets}"></span>`).join('');
+    const warn = o.status === 'draft' && o.totalShortage > 0
+      ? ` <span class="gap-info">缺 ${o.totalShortage} 张</span>` : '';
+    return `<div class="plan-item${cut.detailId === o.id ? ' active' : ''}" data-id="${o.id}">
+      <div>${badge} <b>#${o.id}</b> ${escapeHtml(o.name)}${warn}</div>
+      <div class="muted small">v${o.version} · ${o.copies}件 · 间距 ${o.gap}mm · ${o.totalSheets} 张 ${colors}</div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.plan-item').forEach((div) => {
+    div.addEventListener('click', () => {
+      const o = cut.orders.find((x) => x.id === Number(div.dataset.id));
+      cut.detailId = o.id;
+      renderCutOrderList();
+      renderCutDetail({ order: o });
+    });
+  });
+}
+
+document.getElementById('tabCutting').addEventListener('click', () => switchTab('cutting'));
+document.getElementById('btnGlassAdd').addEventListener('click', addGlassSheet);
+document.getElementById('cutDesignSelect').addEventListener('change', loadCutVersions);
+document.getElementById('btnCutPreview').addEventListener('click', previewCutOrder);

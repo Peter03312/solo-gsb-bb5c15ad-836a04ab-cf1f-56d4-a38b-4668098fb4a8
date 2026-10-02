@@ -7,6 +7,7 @@ const geo = require('./geometry');
 const cut = require('./cutting');
 const leadDiff = require('./leaddiff');
 const printSheet = require('./printsheet');
+const sheetNest = require('./sheetnest');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'studio.db');
@@ -763,6 +764,348 @@ function serializePlan(plan) {
     updatedAt: plan.updatedAt,
     confirmedAt: plan.confirmedAt,
     canceledAt: plan.canceledAt,
+  };
+}
+
+// ---------- 彩色玻璃原片库存（每种颜色一种规格） ----------
+
+app.get('/api/glass-sheets', (req, res) => {
+  res.json({ ok: true, sheets: db.listGlassSheets() });
+});
+
+app.get('/api/glass-sheets/:sheetId', (req, res) => {
+  const sheet = db.getGlassSheet(Number(req.params.sheetId));
+  if (!sheet) return fail(res, 404, '该颜色原片规格不存在');
+  res.json({ ok: true, sheet });
+});
+
+app.post('/api/glass-sheets', (req, res) => {
+  const pr = sheetNest.parseSheetBody(req.body || {});
+  if (!pr.ok) return fail(res, 400, pr.error);
+  const { color, width, height, stock } = pr.params;
+  if (db.getGlassSheetByColorRow(color)) {
+    return fail(res, 409, `颜色 ${color} 的原片规格已登记（一种颜色仅可登记一种规格）`);
+  }
+  const sheet = db.createGlassSheet({ color, width, height, stock });
+  res.status(201).json({ ok: true, sheet });
+});
+
+// 仅允许调整库存张数；颜色/宽高属规格身份不可改。库存不得低于已预留。
+app.patch('/api/glass-sheets/:sheetId', (req, res) => {
+  const sheet = db.getGlassSheet(Number(req.params.sheetId));
+  if (!sheet) return fail(res, 404, '该颜色原片规格不存在');
+  const body = req.body || {};
+  if (body.color !== undefined) return fail(res, 400, '颜色属于规格身份不可修改；请登记新颜色');
+  if (body.width !== undefined || body.height !== undefined) {
+    return fail(res, 400, '原片宽高属于规格身份不可修改；请登记新规格');
+  }
+  if (body.stock === undefined) return fail(res, 400, '没有可更新字段（仅支持 stock）');
+  const stock = Number(body.stock);
+  if (!Number.isInteger(stock) || stock < 0) {
+    return fail(res, 400, '库存张数必须是不小于 0 的整数');
+  }
+  const r = db.updateGlassSheetStock(sheet.id, stock);
+  if (r.code === 'stock_below_reserved') {
+    return fail(res, 409, `库存不得小于已确认订单预留张数（${r.reserved}）`, { reserved: r.reserved });
+  }
+  res.json({ ok: true, sheet: r.sheet });
+});
+
+// ---------- 裁片订单 ----------
+
+const ORDER_NAME_MAX = 80;
+
+// 解析 { publicationId, copies, gap }；返回 { error,status } 或 { pub, copies, gap }
+function resolveNestInputs(body) {
+  const publicationId = Number(body.publicationId);
+  if (!Number.isInteger(publicationId) || publicationId <= 0) {
+    return { error: 'publicationId 必须是已发布版本的正整数 id' };
+  }
+  const pub = db.getPublicationById(publicationId);
+  if (!pub) return { error: '发布版不存在', status: 404 };
+  const pr = sheetNest.parseNestingParams(body);
+  if (!pr.ok) return { error: pr.error };
+  return { pub, copies: pr.params.copies, gap: pr.params.gap };
+}
+
+// 取“颜色 -> 规格（宽/高/id）”，排样只用宽高；库存视图由 serialize 补
+function sheetSpecMap() {
+  const m = new Map();
+  for (const s of db.listGlassSheets()) {
+    m.set(s.color, { id: s.id, width: s.width, height: s.height, stock: s.stock });
+  }
+  return m;
+}
+
+// 生成排样方案；失败整体返回（不落库、不占库存）
+function buildNestLayout(pub, copies, gap) {
+  const specs = sheetSpecMap();
+  const specByColor = new Map();
+  for (const [color, s] of specs) specByColor.set(color, { width: s.width, height: s.height });
+  const r = sheetNest.nestBySnapshot(pub.snapshot, specByColor, copies, gap);
+  if (!r.ok) {
+    return {
+      error: r.error, status: r.status || 422, code: r.code,
+      color: r.color, pieceNo: r.pieceNo, copy: r.copy,
+      pieceWidth: r.pieceWidth, pieceHeight: r.pieceHeight,
+      sheetWidth: r.sheetWidth, sheetHeight: r.sheetHeight,
+      totalSheets: r.totalSheets, maxSheets: r.maxSheets,
+    };
+  }
+  return { layout: r.layout, specs };
+}
+
+// 汇总各色用板数与库存缺口
+function colorSummaries(layout, specs) {
+  return layout.colors.map((c) => {
+    const spec = specs.get(c.color);
+    const stock = spec ? spec.stock : 0;
+    const sheet = spec ? db.getGlassSheet(spec.id) : null;
+    const reserved = sheet ? sheet.reserved : 0;
+    const available = sheet ? sheet.available : 0;
+    return {
+      color: c.color,
+      sheetId: spec ? spec.id : null,
+      sheetWidth: c.sheetWidth,
+      sheetHeight: c.sheetHeight,
+      requiredSheets: c.requiredSheets,
+      stock,
+      reserved,
+      available,
+      shortage: Math.max(0, c.requiredSheets - available),
+    };
+  });
+}
+
+function nestPreviewPayload({ pub, copies, gap, layout, specs, includeItems = false }) {
+  const colors = colorSummaries(layout, specs);
+  const totalShortage = colors.reduce((s, c) => s + c.shortage, 0);
+  const payload = {
+    publicationId: pub.id,
+    designId: pub.designId,
+    version: pub.version,
+    copies,
+    gap,
+    layout,
+    totalSheets: layout.totalSheets,
+    maxSheets: layout.maxSheets,
+    colors,
+    totalShortage,
+    feasible: totalShortage === 0,
+  };
+  if (includeItems) {
+    payload.items = colors.map((c) => ({
+      sheetId: c.sheetId, color: c.color,
+      width: c.sheetWidth, height: c.sheetHeight,
+      requiredSheets: c.requiredSheets,
+    }));
+  }
+  return payload;
+}
+
+function failNest(res, built) {
+  return res.status(built.status || 422).json({
+    ok: false,
+    error: built.error,
+    code: built.code,
+    color: built.color,
+    pieceNo: built.pieceNo,
+    copy: built.copy,
+    pieceWidth: built.pieceWidth,
+    pieceHeight: built.pieceHeight,
+    sheetWidth: built.sheetWidth,
+    sheetHeight: built.sheetHeight,
+    totalSheets: built.totalSheets,
+    maxSheets: built.maxSheets,
+  });
+}
+
+// 预览（不落库、不占库存）
+app.post('/api/cut-orders/preview', (req, res) => {
+  const inp = resolveNestInputs(req.body || {});
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildNestLayout(inp.pub, inp.copies, inp.gap);
+  if (built.error) return failNest(res, built);
+  res.json({
+    ok: true,
+    preview: nestPreviewPayload({
+      pub: inp.pub, copies: inp.copies, gap: inp.gap,
+      layout: built.layout, specs: built.specs,
+    }),
+  });
+});
+
+function orderNameFrom(body, pub, copies) {
+  return typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, ORDER_NAME_MAX)
+    : `玻璃裁片 v${pub.version} ×${copies}件`;
+}
+
+// 建草稿订单
+app.post('/api/cut-orders', (req, res) => {
+  const body = req.body || {};
+  const inp = resolveNestInputs(body);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildNestLayout(inp.pub, inp.copies, inp.gap);
+  if (built.error) return failNest(res, built);
+  const preview = nestPreviewPayload({
+    pub: inp.pub, copies: inp.copies, gap: inp.gap,
+    layout: built.layout, specs: built.specs, includeItems: true,
+  });
+  if (preview.items.some((it) => it.sheetId === null)) {
+    // 理论上 missing_color 已在排样阶段拦截；双保险
+    return fail(res, 422, '缺少对应颜色的原片规格');
+  }
+  const order = db.createCutOrder({
+    name: orderNameFrom(body, inp.pub, inp.copies),
+    publicationId: inp.pub.id,
+    designId: inp.pub.designId,
+    version: inp.pub.version,
+    copies: inp.copies,
+    gap: inp.gap,
+    totalSheets: built.layout.totalSheets,
+    layout: built.layout,
+    items: preview.items,
+  });
+  res.status(201).json({ ok: true, order: serializeCutOrder(order) });
+});
+
+app.get('/api/cut-orders', (req, res) => {
+  res.json({ ok: true, orders: db.listCutOrders().map(serializeCutOrder) });
+});
+
+app.get('/api/cut-orders/:orderId', (req, res) => {
+  const order = db.getCutOrder(Number(req.params.orderId));
+  if (!order) return fail(res, 404, '裁片订单不存在');
+  res.json({ ok: true, order: serializeCutOrder(order) });
+});
+
+// 修改草稿（重选版本/件数/间距并重算排样）
+app.put('/api/cut-orders/:orderId', (req, res) => {
+  const order = db.getCutOrder(Number(req.params.orderId));
+  if (!order) return fail(res, 404, '裁片订单不存在');
+  if (order.status !== 'draft') {
+    return fail(res, 409, `仅草稿订单可修改（当前为 ${cutStatusZh(order.status)}）`);
+  }
+  const body = req.body || {};
+  const merged = {
+    publicationId: body.publicationId !== undefined ? Number(body.publicationId) : order.publicationId,
+    copies: body.copies !== undefined ? Number(body.copies) : order.copies,
+    gap: body.gap !== undefined ? Number(body.gap) : order.gap,
+  };
+  const inp = resolveNestInputs(merged);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildNestLayout(inp.pub, inp.copies, inp.gap);
+  if (built.error) return failNest(res, built);
+  const preview = nestPreviewPayload({
+    pub: inp.pub, copies: inp.copies, gap: inp.gap,
+    layout: built.layout, specs: built.specs, includeItems: true,
+  });
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, ORDER_NAME_MAX)
+    : order.name;
+  const r = db.updateCutOrderDraft(order.id, {
+    name,
+    publicationId: inp.pub.id,
+    designId: inp.pub.designId,
+    version: inp.pub.version,
+    copies: inp.copies,
+    gap: inp.gap,
+    totalSheets: built.layout.totalSheets,
+    layout: built.layout,
+    items: preview.items,
+  });
+  if (r.code !== 'ok') return fail(res, 409, '订单状态已变化，请刷新后重试');
+  res.json({ ok: true, order: serializeCutOrder(r.order) });
+});
+
+// 确认：原子预留所有颜色所需原片；任一颜色不足整单失败（409）
+app.post('/api/cut-orders/:orderId/confirm', (req, res) => {
+  const order = db.getCutOrder(Number(req.params.orderId));
+  if (!order) return fail(res, 404, '裁片订单不存在');
+  const r = db.confirmCutOrder(order.id);
+  if (r.code === 'already_confirmed') {
+    return res.status(409).json({
+      ok: false, error: '订单已确认，无需重复确认（库存未重复预留）',
+      order: serializeCutOrder(db.getCutOrder(order.id)),
+    });
+  }
+  if (r.code === 'order_canceled') return fail(res, 409, '订单已取消，不能确认；请新建订单');
+  if (r.code === 'sheet_missing') return fail(res, 409, `颜色 ${r.color} 的原片规格已不存在，无法确认`);
+  if (r.code === 'sheet_changed') {
+    return fail(res, 409, `颜色 ${r.color} 的原片规格自订单创建后已变化，请按新规格重建订单`);
+  }
+  if (r.code === 'shortage') {
+    return res.status(409).json({
+      ok: false,
+      code: 'shortage',
+      error: '部分颜色原片库存不足，整单未确认（未预留任何一张）',
+      shortages: r.shortages,
+      order: serializeCutOrder(db.getCutOrder(order.id)),
+    });
+  }
+  res.json({ ok: true, order: serializeCutOrder(r.order) });
+});
+
+// 取消：只释放一次；重复取消不重复改库存
+app.post('/api/cut-orders/:orderId/cancel', (req, res) => {
+  const order = db.getCutOrder(Number(req.params.orderId));
+  if (!order) return fail(res, 404, '裁片订单不存在');
+  const r = db.cancelCutOrder(order.id);
+  if (r.code === 'draft_not_reserved') {
+    return fail(res, 409, '草稿订单尚未预留库存，无需取消（可直接删除）');
+  }
+  if (r.code === 'already_canceled') {
+    return res.status(409).json({
+      ok: false, error: '订单已取消，库存此前已释放，未重复变更',
+      order: serializeCutOrder(db.getCutOrder(order.id)),
+    });
+  }
+  res.json({ ok: true, order: serializeCutOrder(r.order) });
+});
+
+app.delete('/api/cut-orders/:orderId', (req, res) => {
+  const r = db.deleteCutOrder(Number(req.params.orderId));
+  if (r.code === 'not_found') return fail(res, 404, '裁片订单不存在');
+  if (r.code === 'confirmed_delete_blocked') {
+    return fail(res, 409, '已确认订单不能删除；请先取消以释放库存');
+  }
+  res.json({ ok: true });
+});
+
+function cutStatusZh(status) {
+  return status === 'draft' ? '草稿' : status === 'confirmed' ? '已确认' : '已取消';
+}
+
+// 订单输出：排样方案为建单时快照；库存视图取当前值（预览缺口仅对草稿有意义）
+function serializeCutOrder(order) {
+  const specs = sheetSpecMap();
+  const colors = colorSummaries(order.layout, specs);
+  const totalShortage = order.status === 'draft'
+    ? colors.reduce((s, c) => s + c.shortage, 0)
+    : 0;
+  return {
+    id: order.id,
+    name: order.name,
+    status: order.status,
+    statusText: cutStatusZh(order.status),
+    publicationId: order.publicationId,
+    designId: order.designId,
+    version: order.version,
+    copies: order.copies,
+    gap: order.gap,
+    totalSheets: order.totalSheets,
+    maxSheets: order.layout.maxSheets || sheetNest.MAX_SHEETS,
+    layout: order.layout,
+    colors,
+    items: db.listCutOrderItems(order.id),
+    totalShortage,
+    feasible: order.status !== 'draft' || totalShortage === 0,
+    snapshotBound: true,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    confirmedAt: order.confirmedAt,
+    canceledAt: order.canceledAt,
   };
 }
 
