@@ -82,6 +82,50 @@ function init(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_plans_status  ON lead_plans(status);
     CREATE INDEX IF NOT EXISTS idx_plans_pub     ON lead_plans(publication_id);
     CREATE INDEX IF NOT EXISTS idx_plans_mat     ON lead_plans(material_id);
+
+    -- 彩色玻璃原片：每种颜色一种原片规格（宽高 1–2000 整数毫米），登记库存张数
+    CREATE TABLE IF NOT EXISTS glass_materials (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      color       TEXT    NOT NULL UNIQUE,        -- 归一为小写 #rrggbb
+      name        TEXT,                           -- 可选备注名
+      width_mm    INTEGER NOT NULL CHECK (width_mm  BETWEEN 1 AND 2000),
+      height_mm   INTEGER NOT NULL CHECK (height_mm BETWEEN 1 AND 2000),
+      stock       INTEGER NOT NULL CHECK (stock >= 0),
+      created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- 玻璃裁片单：草稿不预留；确认时对 layout.colors 中所有颜色原子预留；取消整单释放。
+    -- 绑定发布快照；草稿变化/再发布均不影响已确认方案。
+    CREATE TABLE IF NOT EXISTS glass_plans (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      name             TEXT    NOT NULL,
+      status           TEXT    NOT NULL CHECK (status IN ('draft','confirmed','canceled')),
+      publication_id   INTEGER NOT NULL REFERENCES publications(id),
+      design_id        INTEGER NOT NULL,
+      version          INTEGER NOT NULL,
+      copies           INTEGER NOT NULL CHECK (copies > 0),
+      gap_mm           INTEGER NOT NULL CHECK (gap_mm BETWEEN 0 AND 50),
+      total_sheets     INTEGER NOT NULL CHECK (total_sheets BETWEEN 1 AND 60),
+      total_pieces     INTEGER NOT NULL,
+      layout           TEXT    NOT NULL,          -- 排样 JSON（含逐色逐板放置，快照）
+      created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+      confirmed_at     TEXT,
+      canceled_at      TEXT
+    );
+
+    -- 每张裁片单按颜色记录预留张数（确认时据此原子预留，库存不足则整单失败）
+    CREATE TABLE IF NOT EXISTS glass_plan_colors (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      plan_id     INTEGER NOT NULL REFERENCES glass_plans(id) ON DELETE CASCADE,
+      color       TEXT    NOT NULL,
+      sheets      INTEGER NOT NULL CHECK (sheets > 0),
+      UNIQUE (plan_id, color)
+    );
+    CREATE INDEX IF NOT EXISTS idx_gplans_status ON glass_plans(status);
+    CREATE INDEX IF NOT EXISTS idx_gplans_pub    ON glass_plans(publication_id);
+    CREATE INDEX IF NOT EXISTS idx_gpc_color     ON glass_plan_colors(color);
   `);
   return db;
 }
@@ -466,6 +510,253 @@ function deletePlan(id) {
   return { code: 'ok' };
 }
 
+// ---------- 彩色玻璃原片 ----------
+
+function rowToGlassMaterial(row) {
+  return {
+    id: row.id,
+    color: row.color,
+    name: row.name,
+    width: row.width_mm,
+    height: row.height_mm,
+    stock: row.stock,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// 各颜色当前被已确认裁片单预留的张数
+function glassReservedMap() {
+  const rows = getDb()
+    .prepare(`SELECT color, COALESCE(SUM(sheets), 0) AS reserved
+              FROM glass_plan_colors c
+              JOIN glass_plans p ON p.id = c.plan_id
+              WHERE p.status = 'confirmed'
+              GROUP BY color`)
+    .all();
+  const m = new Map();
+  for (const r of rows) m.set(r.color, r.reserved);
+  return m;
+}
+
+function listGlassMaterials() {
+  const reserved = glassReservedMap();
+  return getDb().prepare('SELECT * FROM glass_materials ORDER BY id').all().map((r) => {
+    const m = rowToGlassMaterial(r);
+    const used = reserved.get(m.color) || 0;
+    m.reserved = used;
+    m.available = m.stock - used;
+    return m;
+  });
+}
+
+function getGlassMaterialRow(id) {
+  return getDb().prepare('SELECT * FROM glass_materials WHERE id = ?').get(id);
+}
+
+function getGlassMaterialByColor(color) {
+  return getDb().prepare('SELECT * FROM glass_materials WHERE color = ?').get(color) || null;
+}
+
+function getGlassMaterial(id) {
+  const row = getGlassMaterialRow(id);
+  if (!row) return null;
+  const m = rowToGlassMaterial(row);
+  const reserved = getDb()
+    .prepare(`SELECT COALESCE(SUM(c.sheets),0) AS n
+              FROM glass_plan_colors c JOIN glass_plans p ON p.id = c.plan_id
+              WHERE c.color = ? AND p.status = 'confirmed'`)
+    .get(m.color).n;
+  m.reserved = reserved;
+  m.available = m.stock - reserved;
+  return m;
+}
+
+function createGlassMaterial({ color, name, width, height, stock }) {
+  const info = getDb()
+    .prepare('INSERT INTO glass_materials (color, name, width_mm, height_mm, stock) VALUES (?, ?, ?, ?, ?)')
+    .run(color, name, width, height, stock);
+  return getGlassMaterial(info.lastInsertRowid);
+}
+
+// 只允许改备注名与库存张数（颜色/宽高属于规格身份）。库存不得小于已预留。
+function updateGlassMaterial(id, { name, stock }) {
+  const d = getDb();
+  const txn = d.transaction(() => {
+    const row = getGlassMaterialRow(id);
+    if (!row) return { code: 'not_found' };
+    if (stock !== undefined) {
+      const reserved = d
+        .prepare(`SELECT COALESCE(SUM(c.sheets),0) AS n
+                  FROM glass_plan_colors c JOIN glass_plans p ON p.id = c.plan_id
+                  WHERE c.color = ? AND p.status = 'confirmed'`)
+        .get(row.color).n;
+      if (stock < reserved) return { code: 'stock_below_reserved', reserved };
+      d.prepare("UPDATE glass_materials SET stock = ?, updated_at = datetime('now') WHERE id = ?").run(stock, id);
+    }
+    if (name !== undefined) {
+      d.prepare("UPDATE glass_materials SET name = ?, updated_at = datetime('now') WHERE id = ?").run(name, id);
+    }
+    return { code: 'ok', material: getGlassMaterial(id) };
+  });
+  return txn.immediate();
+}
+
+// ---------- 玻璃裁片单 ----------
+
+function createGlassPlan(p) {
+  const d = getDb();
+  const txn = d.transaction(() => {
+    const info = d.prepare(`INSERT INTO glass_plans
+      (name, status, publication_id, design_id, version, copies, gap_mm, total_sheets, total_pieces, layout)
+      VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(p.name, p.publicationId, p.designId, p.version, p.copies, p.gap,
+        p.totalSheets, p.totalPieces, JSON.stringify(p.layout));
+    const id = info.lastInsertRowid;
+    for (const c of p.colorRows) {
+      d.prepare('INSERT INTO glass_plan_colors (plan_id, color, sheets) VALUES (?, ?, ?)')
+        .run(id, c.color, c.sheets);
+    }
+    return id;
+  });
+  const id = txn();
+  return getGlassPlan(id);
+}
+
+function getGlassPlanRow(id) {
+  return getDb().prepare('SELECT * FROM glass_plans WHERE id = ?').get(id);
+}
+
+function getGlassPlanColorRows(planId) {
+  return getDb()
+    .prepare('SELECT color, sheets FROM glass_plan_colors WHERE plan_id = ? ORDER BY color')
+    .all(planId);
+}
+
+function rowToGlassPlan(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    status: row.status,
+    publicationId: row.publication_id,
+    designId: row.design_id,
+    version: row.version,
+    copies: row.copies,
+    gap: row.gap_mm,
+    totalSheets: row.total_sheets,
+    totalPieces: row.total_pieces,
+    layout: JSON.parse(row.layout),
+    colors: getGlassPlanColorRows(row.id),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    confirmedAt: row.confirmed_at || null,
+    canceledAt: row.canceled_at || null,
+  };
+}
+
+function getGlassPlan(id) {
+  return rowToGlassPlan(getGlassPlanRow(id));
+}
+
+function listGlassPlans() {
+  return getDb().prepare('SELECT * FROM glass_plans ORDER BY id DESC').all().map(rowToGlassPlan);
+}
+
+function updateGlassPlanDraft(id, p) {
+  const row = getGlassPlanRow(id);
+  if (!row) return { code: 'not_found' };
+  if (row.status !== 'draft') return { code: 'not_draft', status: row.status };
+  const d = getDb();
+  const txn = d.transaction(() => {
+    d.prepare(`UPDATE glass_plans SET
+       name = ?, publication_id = ?, design_id = ?, version = ?, copies = ?, gap_mm = ?,
+       total_sheets = ?, total_pieces = ?, layout = ?, updated_at = datetime('now')
+     WHERE id = ?`)
+      .run(p.name, p.publicationId, p.designId, p.version, p.copies, p.gap,
+        p.totalSheets, p.totalPieces, JSON.stringify(p.layout), id);
+    d.prepare('DELETE FROM glass_plan_colors WHERE plan_id = ?').run(id);
+    for (const c of p.colorRows) {
+      d.prepare('INSERT INTO glass_plan_colors (plan_id, color, sheets) VALUES (?, ?, ?)')
+        .run(id, c.color, c.sheets);
+    }
+  });
+  txn();
+  return { code: 'ok', plan: getGlassPlan(id) };
+}
+
+// 确认：在一个 BEGIN IMMEDIATE 事务内核对全部颜色库存，任一颜色不足则整单回滚，
+// 绝不产生“部分颜色预留”的半方案；并发确认也不会超卖。
+function confirmGlassPlan(id) {
+  const d = getDb();
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    const row = getGlassPlanRow(id);
+    if (!row) { d.exec('ROLLBACK'); return { code: 'not_found' }; }
+    if (row.status === 'confirmed') { d.exec('ROLLBACK'); return { code: 'already_confirmed' }; }
+    if (row.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'plan_canceled' }; }
+
+    const colorRows = getGlassPlanColorRows(id);
+    const shortages = [];
+    for (const c of colorRows) {
+      const mat = getGlassMaterialByColor(c.color);
+      if (!mat) {
+        d.exec('ROLLBACK');
+        return { code: 'material_missing', missingColor: c.color };
+      }
+      const reserved = d
+        .prepare(`SELECT COALESCE(SUM(cc.sheets),0) AS n
+                  FROM glass_plan_colors cc JOIN glass_plans pp ON pp.id = cc.plan_id
+                  WHERE cc.color = ? AND pp.status = 'confirmed'`)
+        .get(c.color).n;
+      const available = mat.stock - reserved;
+      if (c.sheets > available) {
+        shortages.push({ color: c.color, required: c.sheets, available, shortage: c.sheets - available });
+      }
+    }
+    if (shortages.length) {
+      d.exec('ROLLBACK');
+      return { code: 'shortage', shortages };
+    }
+    d.prepare(`UPDATE glass_plans
+      SET status = 'confirmed', confirmed_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ? AND status = 'draft'`).run(id);
+    d.exec('COMMIT');
+    return { code: 'ok', plan: getGlassPlan(id) };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+// 取消：仅已确认单会释放（全部颜色）预留；重复取消不再次改库存。
+function cancelGlassPlan(id) {
+  const row = getGlassPlanRow(id);
+  if (!row) return { code: 'not_found' };
+  if (row.status === 'draft') return { code: 'draft_not_reserved' };
+  if (row.status === 'canceled') return { code: 'already_canceled' };
+  const d = getDb();
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    d.prepare(`UPDATE glass_plans
+      SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ? AND status = 'confirmed'`).run(id);
+    d.exec('COMMIT');
+    return { code: 'ok', plan: getGlassPlan(id) };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+function deleteGlassPlan(id) {
+  const row = getGlassPlanRow(id);
+  if (!row) return { code: 'not_found' };
+  if (row.status === 'confirmed') return { code: 'confirmed_delete_blocked' };
+  getDb().prepare('DELETE FROM glass_plans WHERE id = ?').run(id); // 连带 glass_plan_colors 级联
+  return { code: 'ok' };
+}
+
 module.exports = {
   init, getDb,
   createDesign, getDesign, listDesigns,
@@ -473,4 +764,8 @@ module.exports = {
   publishVersion, getPublication, getPublicationByVersion, getPublicationById, listPublications,
   listMaterials, getMaterial, getMaterialRow, getMaterialByName, createMaterial, updateMaterial,
   createPlan, getPlan, listPlans, updatePlanDraft, confirmPlan, cancelPlan, deletePlan,
+  listGlassMaterials, getGlassMaterial, getGlassMaterialRow, getGlassMaterialByColor,
+  createGlassMaterial, updateGlassMaterial,
+  createGlassPlan, getGlassPlan, listGlassPlans, updateGlassPlanDraft,
+  confirmGlassPlan, cancelGlassPlan, deleteGlassPlan,
 };

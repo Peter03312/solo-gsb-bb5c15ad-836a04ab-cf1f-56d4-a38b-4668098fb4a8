@@ -15,6 +15,7 @@
       <button id="tabDiff" class="tab">版本核对</button>
       <button id="tabPrint" class="tab">分张打印</button>
       <button id="tabProduction" class="tab">铅条生产</button>
+      <button id="tabGlass" class="tab">原片裁片</button>
     </nav>
   </header>
 
@@ -271,6 +272,68 @@
       <div id="previewBox" class="lead-panel">
         <h2>排产预览 / 计划详情</h2>
         <div id="previewContent" class="hint">在左侧选择发布版本、件数、原材规格与每刀损耗，点击“排产预览”。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 原片裁片视图 ============ -->
+  <main id="viewGlass" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 原片库存（每种颜色一种规格）</h2>
+        <div id="glassMatList"></div>
+        <details>
+          <summary>登记颜色原片规格与库存张数</summary>
+          <div class="form-row">
+            <label>颜色<input id="glassColor" type="color" value="#4c9aff"></label>
+          </div>
+          <div class="form-row">
+            <label>备注名（可选）<input id="glassName" type="text" placeholder="如：钴蓝 3mm" maxlength="80"></label>
+          </div>
+          <div class="form-row two">
+            <label>原片宽 (mm)<input id="glassWidth" type="number" min="1" max="2000" step="1" value="1000"></label>
+            <label>原片高 (mm)<input id="glassHeight" type="number" min="1" max="2000" step="1" value="800"></label>
+          </div>
+          <div class="form-row">
+            <label>库存张数<input id="glassStock" type="number" min="0" step="1" value="5"></label>
+          </div>
+          <button id="btnGlassAdd" class="primary">登记</button>
+          <div id="glassMatMsg" class="hint"></div>
+        </details>
+      </section>
+
+      <section>
+        <h2>② 按发布快照排样（草稿）</h2>
+        <div class="form-row">
+          <label>裁片单名称<input id="glassPlanName" type="text" placeholder="留空自动命名" maxlength="80"></label>
+        </div>
+        <label>图纸
+          <select id="glassDesignSelect"></select>
+        </label>
+        <label>发布版本（按该版快照颜色排样）
+          <select id="glassVersionSelect"></select>
+        </label>
+        <div class="form-row two">
+          <label>制作件数<input id="glassCopies" type="number" min="1" step="1" value="1"></label>
+          <label>片间最小间距 (mm)<input id="glassGap" type="number" min="0" max="50" step="1" value="3"></label>
+        </div>
+        <div class="btn-row">
+          <button id="btnGlassPreview" class="primary big">排样预览（不占库存）</button>
+        </div>
+        <div id="glassPlanMsg" class="hint">每片仅平移或旋转 90° 整数倍（不镜像）；总裁片数最多 60 张。相同版本与排样参数的布局始终一致，不追求全局最少用板。缺色、单片放不下、参数非法或超上限时整单报错。</div>
+      </section>
+
+      <section>
+        <h2>③ 裁片单列表</h2>
+        <div id="glassPlanList"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="glassBanner" class="banner" hidden></div>
+      <div id="glassPreviewBox" class="lead-panel">
+        <h2>排样预览 / 裁片单详情</h2>
+        <div id="glassContent" class="hint">在左侧登记各颜色原片，选择发布版本、件数与片间最小间距，点击“排样预览”。</div>
       </div>
     </section>
   </main>

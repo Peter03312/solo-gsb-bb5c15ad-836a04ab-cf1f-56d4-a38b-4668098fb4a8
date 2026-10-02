@@ -7,6 +7,7 @@ const geo = require('./geometry');
 const cut = require('./cutting');
 const leadDiff = require('./leaddiff');
 const printSheet = require('./printsheet');
+const nesting = require('./nesting');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'studio.db');
@@ -758,6 +759,384 @@ function serializePlan(plan) {
     availableBars: material ? material.available : 0,
     shortage: plan.status === 'draft' ? shortage : 0,
     feasible: plan.status !== 'draft' || shortage === 0,
+    snapshotBound: true,
+    createdAt: plan.createdAt,
+    updatedAt: plan.updatedAt,
+    confirmedAt: plan.confirmedAt,
+    canceledAt: plan.canceledAt,
+  };
+}
+
+// ---------- 彩色玻璃原片库存 ----------
+
+// 每种颜色一种原片规格（宽高 1–2000 整数毫米）；颜色为 #RRGGBB，备注名可选。
+app.get('/api/glass-materials', (req, res) => {
+  res.json({ ok: true, materials: db.listGlassMaterials() });
+});
+
+app.get('/api/glass-materials/:materialId', (req, res) => {
+  const material = db.getGlassMaterial(Number(req.params.materialId));
+  if (!material) return fail(res, 404, '原片规格不存在');
+  res.json({ ok: true, material });
+});
+
+app.post('/api/glass-materials', (req, res) => {
+  const body = req.body || {};
+  const color = String(body.color || '').trim().toLowerCase();
+  if (!COLOR_RE.test(color)) return fail(res, 400, '颜色必须是 #RRGGBB 形式');
+  const wR = nesting.parseSheetSide(Number(body.width), '原片宽');
+  if (!wR.ok) return fail(res, 400, wR.error);
+  const hR = nesting.parseSheetSide(Number(body.height), '原片高');
+  if (!hR.ok) return fail(res, 400, hR.error);
+  const stock = cut.parseNonNegInt(Number(body.stock), { name: '库存张数', max: 1e9 });
+  if (!stock.ok) return fail(res, 400, stock.error);
+  const name = body.name === undefined || body.name === null
+    ? null
+    : (typeof body.name === 'string' ? body.name.trim().slice(0, 80) : null);
+  if (db.getGlassMaterialByColor(color)) {
+    return fail(res, 409, `颜色 ${color} 已登记原片规格；请直接调整库存`, { color });
+  }
+  const material = db.createGlassMaterial({
+    color, name, width: wR.n, height: hR.n, stock: stock.n,
+  });
+  res.status(201).json({ ok: true, material });
+});
+
+// 只允许改备注名/库存张数（颜色与宽高属于规格身份）；库存不得低于已预留。
+app.patch('/api/glass-materials/:materialId', (req, res) => {
+  const material = db.getGlassMaterial(Number(req.params.materialId));
+  if (!material) return fail(res, 404, '原片规格不存在');
+  const body = req.body || {};
+  const fields = {};
+  if (body.name !== undefined) {
+    fields.name = body.name === null || body.name === ''
+      ? null
+      : (typeof body.name === 'string' ? body.name.trim().slice(0, 80) : null);
+  }
+  if (body.stock !== undefined) {
+    const stock = cut.parseNonNegInt(Number(body.stock), { name: '库存张数', max: 1e9 });
+    if (!stock.ok) return fail(res, 400, stock.error);
+    fields.stock = stock.n;
+  }
+  for (const k of ['color', 'width', 'height']) {
+    if (body[k] !== undefined) {
+      return fail(res, 400, '颜色与原片宽高属于规格身份不可修改；请为新规格登记新颜色或新建条目');
+    }
+  }
+  if (!('name' in fields) && !('stock' in fields)) {
+    return fail(res, 400, '没有可更新字段（name 或 stock）');
+  }
+  const r = db.updateGlassMaterial(material.id, fields);
+  if (r.code === 'stock_below_reserved') {
+    return res.status(409).json({
+      ok: false,
+      error: `库存不得小于已确认裁片单预留张数（${r.reserved}）`,
+      code: 'stock_below_reserved', reserved: r.reserved,
+    });
+  }
+  res.json({ ok: true, material: r.material });
+});
+
+// ---------- 玻璃裁片单（排样 / 草稿 / 确认 / 取消） ----------
+
+// 解析并校验裁片输入；任何非法输入都在排样前拒绝，绝不产生部分方案。
+function resolveGlassInputs(body) {
+  const publicationId = Number(body.publicationId);
+  if (!Number.isInteger(publicationId) || publicationId <= 0) {
+    return { error: 'publicationId 必须是已发布版本的正整数 id' };
+  }
+  const pub = db.getPublicationById(publicationId);
+  if (!pub) return { error: '发布版不存在', status: 404 };
+
+  const copiesR = nesting.parseCopies(Number(body.copies));
+  if (!copiesR.ok) return { error: copiesR.error };
+  const gapR = nesting.parseGap(body.gap === undefined ? 0 : Number(body.gap));
+  if (!gapR.ok) return { error: gapR.error };
+
+  return { pub, copies: copiesR.n, gap: gapR.n };
+}
+
+// 为排样收集快照所需颜色的原片规格（缺色由 nesting 核心整单拒绝）
+function glassMaterialMap(snapshot) {
+  const byColor = new Map();
+  for (const m of db.listGlassMaterials()) byColor.set(m.color, m);
+  const map = new Map();
+  const colors = [...new Set((snapshot.pieces || []).map((p) => String(p.color).toLowerCase()))];
+  for (const c of colors) {
+    const m = byColor.get(c);
+    if (m) map.set(c, { id: m.id, color: m.color, width: m.width, height: m.height });
+  }
+  return map;
+}
+
+// 依据发布快照 + 参数排样；layout 完全由快照颜色与参数决定（确定性）。
+function buildGlassLayout({ pub, copies, gap }) {
+  const materials = glassMaterialMap(pub.snapshot);
+  const r = nesting.planNesting({ snapshot: pub.snapshot, copies, gap, materials });
+  return r;
+}
+
+// 逐色库存视图：用板/库存/已预留/可用/缺口
+function decorateLayoutColors(layout) {
+  const byColor = new Map(db.listGlassMaterials().map((m) => [m.color, m]));
+  let totalShortage = 0;
+  const colors = layout.colors.map((c) => {
+    const m = byColor.get(c.color);
+    const stock = m ? m.stock : null;
+    const reserved = m ? m.reserved : null;
+    const available = m ? m.available : 0;
+    const shortage = Math.max(0, c.sheets - available);
+    totalShortage += shortage;
+    return {
+      color: c.color,
+      materialId: m ? m.id : null,
+      name: m ? m.name : null,
+      sheetWidth: c.sheetWidth,
+      sheetHeight: c.sheetHeight,
+      usedSheets: c.sheets,
+      pieceCount: c.pieceCount,
+      stock,
+      reserved,
+      available,
+      shortage,
+      boards: c.boards,
+    };
+  });
+  return { colors, totalShortage };
+}
+
+function serializeGlassLayout(layout) {
+  const dec = decorateLayoutColors(layout);
+  return {
+    gap: layout.gap,
+    copies: layout.copies,
+    totalSheets: layout.totalSheets,
+    totalPieces: layout.totalPieces,
+    colors: dec.colors,
+    totalShortage: dec.totalShortage,
+    feasible: dec.totalShortage === 0,
+  };
+}
+
+function glassColorRows(layout) {
+  return layout.colors.map((c) => ({ color: c.color, sheets: c.sheets }));
+}
+
+// 预览（POST /api/glass-plans/preview）：不落库、不占库存；缺色/单片放不下/参数非法/超 60 张整单报错
+app.post('/api/glass-plans/preview', (req, res) => {
+  const body = req.body || {};
+  const inp = resolveGlassInputs(body);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const r = buildGlassLayout(inp);
+  if (!r.ok) {
+    return res.status(r.status || 400).json({
+      ok: false, error: r.error, code: r.code,
+      missingColors: r.missingColors,
+      pieceNo: r.pieceNo, copy: r.copy, color: r.color,
+      pieceWidth: r.pieceWidth, pieceHeight: r.pieceHeight,
+      sheetWidth: r.sheetWidth, sheetHeight: r.sheetHeight,
+      totalSheets: r.totalSheets, maxSheets: r.maxSheets,
+    });
+  }
+  res.json({
+    ok: true,
+    preview: {
+      publicationId: inp.pub.id,
+      designId: inp.pub.designId,
+      version: inp.pub.version,
+      copies: inp.copies,
+      gap: inp.gap,
+      layout: serializeGlassLayout(r.layout),
+    },
+  });
+});
+
+// 建草稿裁片单
+app.post('/api/glass-plans', (req, res) => {
+  const body = req.body || {};
+  const inp = resolveGlassInputs(body);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const r = buildGlassLayout(inp);
+  if (!r.ok) {
+    return res.status(r.status || 400).json({
+      ok: false, error: r.error, code: r.code,
+      missingColors: r.missingColors,
+      pieceNo: r.pieceNo, copy: r.copy, color: r.color,
+      pieceWidth: r.pieceWidth, pieceHeight: r.pieceHeight,
+      sheetWidth: r.sheetWidth, sheetHeight: r.sheetHeight,
+      totalSheets: r.totalSheets, maxSheets: r.maxSheets,
+    });
+  }
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, PLAN_NAME_MAX)
+    : `玻璃裁片 v${inp.pub.version} ×${inp.copies}件 · 间距${inp.gap}mm`;
+  const plan = db.createGlassPlan({
+    name,
+    publicationId: inp.pub.id,
+    designId: inp.pub.designId,
+    version: inp.pub.version,
+    copies: inp.copies,
+    gap: inp.gap,
+    totalSheets: r.layout.totalSheets,
+    totalPieces: r.layout.totalPieces,
+    layout: r.layout,
+    colorRows: glassColorRows(r.layout),
+  });
+  res.status(201).json({ ok: true, plan: serializeGlassPlan(plan) });
+});
+
+app.get('/api/glass-plans', (req, res) => {
+  res.json({ ok: true, plans: db.listGlassPlans().map(serializeGlassPlan) });
+});
+
+app.get('/api/glass-plans/:planId', (req, res) => {
+  const plan = db.getGlassPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '裁片单不存在');
+  res.json({ ok: true, plan: serializeGlassPlan(plan) });
+});
+
+// 修改草稿（重选版本/件数/间距并重排）
+app.put('/api/glass-plans/:planId', (req, res) => {
+  const plan = db.getGlassPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '裁片单不存在');
+  if (plan.status !== 'draft') {
+    return fail(res, 409, `仅草稿裁片单可修改（当前为 ${glassStatusZh(plan.status)}）`);
+  }
+  const body = req.body || {};
+  const merged = {
+    publicationId: body.publicationId !== undefined ? Number(body.publicationId) : plan.publicationId,
+    copies: body.copies !== undefined ? Number(body.copies) : plan.copies,
+    gap: body.gap !== undefined ? Number(body.gap) : plan.gap,
+  };
+  const inp = resolveGlassInputs(merged);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const r = buildGlassLayout(inp);
+  if (!r.ok) {
+    return res.status(r.status || 400).json({
+      ok: false, error: r.error, code: r.code,
+      missingColors: r.missingColors,
+      pieceNo: r.pieceNo, copy: r.copy, color: r.color,
+      pieceWidth: r.pieceWidth, pieceHeight: r.pieceHeight,
+      sheetWidth: r.sheetWidth, sheetHeight: r.sheetHeight,
+      totalSheets: r.totalSheets, maxSheets: r.maxSheets,
+    });
+  }
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, PLAN_NAME_MAX)
+    : plan.name;
+  const up = db.updateGlassPlanDraft(plan.id, {
+    name,
+    publicationId: inp.pub.id,
+    designId: inp.pub.designId,
+    version: inp.pub.version,
+    copies: inp.copies,
+    gap: inp.gap,
+    totalSheets: r.layout.totalSheets,
+    totalPieces: r.layout.totalPieces,
+    layout: r.layout,
+    colorRows: glassColorRows(r.layout),
+  });
+  if (up.code !== 'ok') return fail(res, 409, '裁片单状态已变化，请刷新后重试');
+  res.json({ ok: true, plan: serializeGlassPlan(up.plan) });
+});
+
+// 确认：原子预留所有颜色所需张数；任一颜色不足整单失败（不产生部分预留）
+app.post('/api/glass-plans/:planId/confirm', (req, res) => {
+  const plan = db.getGlassPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '裁片单不存在');
+  const r = db.confirmGlassPlan(plan.id);
+  if (r.code === 'already_confirmed') {
+    return res.status(409).json({
+      ok: false, error: '裁片单已确认，无需重复确认（库存未重复预留）',
+      plan: serializeGlassPlan(db.getGlassPlan(plan.id)),
+    });
+  }
+  if (r.code === 'plan_canceled') return fail(res, 409, '裁片单已取消，不能确认；请新建裁片单');
+  if (r.code === 'material_missing') {
+    return fail(res, 409, `颜色 ${r.missingColor} 的原片规格已不存在，无法确认`, { missingColor: r.missingColor });
+  }
+  if (r.code === 'shortage') {
+    return res.status(409).json({
+      ok: false,
+      error: '部分颜色原片库存不足，整单确认失败（未产生任何预留）：' +
+        r.shortages.map((s) => `${s.color} 需 ${s.required} 张、可用 ${s.available} 张、缺 ${s.shortage} 张`).join('；'),
+      code: 'shortage',
+      shortages: r.shortages,
+    });
+  }
+  res.json({ ok: true, plan: serializeGlassPlan(r.plan) });
+});
+
+// 取消：整单释放一次；重复取消不再次改库存
+app.post('/api/glass-plans/:planId/cancel', (req, res) => {
+  const plan = db.getGlassPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '裁片单不存在');
+  const r = db.cancelGlassPlan(plan.id);
+  if (r.code === 'draft_not_reserved') {
+    return fail(res, 409, '草稿裁片单尚未预留库存，无需取消（可直接删除）');
+  }
+  if (r.code === 'already_canceled') {
+    return res.status(409).json({
+      ok: false, error: '裁片单已取消，库存此前已释放，未重复变更',
+      plan: serializeGlassPlan(db.getGlassPlan(plan.id)),
+    });
+  }
+  res.json({ ok: true, plan: serializeGlassPlan(r.plan) });
+});
+
+// 删除草稿/已取消裁片单（已确认须先取消）
+app.delete('/api/glass-plans/:planId', (req, res) => {
+  const r = db.deleteGlassPlan(Number(req.params.planId));
+  if (r.code === 'not_found') return fail(res, 404, '裁片单不存在');
+  if (r.code === 'confirmed_delete_blocked') {
+    return fail(res, 409, '已确认裁片单不能删除；请先取消以释放库存');
+  }
+  res.json({ ok: true });
+});
+
+function glassStatusZh(status) {
+  return status === 'draft' ? '草稿' : status === 'confirmed' ? '已确认' : '已取消';
+}
+
+// 裁片单输出：排样为绑定快照的确定方案；另附各色当前库存视图
+function serializeGlassPlan(plan) {
+  const byColor = new Map(db.listGlassMaterials().map((m) => [m.color, m]));
+  let totalShortage = 0;
+  const colors = plan.layout.colors.map((c) => {
+    const m = byColor.get(c.color);
+    const available = m ? m.available : 0;
+    const shortage = Math.max(0, c.sheets - available);
+    if (plan.status === 'draft') totalShortage += shortage;
+    return {
+      color: c.color,
+      materialId: m ? m.id : null,
+      name: m ? m.name : null,
+      sheetWidth: c.sheetWidth,
+      sheetHeight: c.sheetHeight,
+      usedSheets: c.sheets,
+      pieceCount: c.pieceCount,
+      stock: m ? m.stock : null,
+      reserved: m ? m.reserved : null,
+      available,
+      shortage,
+      boards: c.boards,
+    };
+  });
+  return {
+    id: plan.id,
+    name: plan.name,
+    status: plan.status,
+    statusText: glassStatusZh(plan.status),
+    publicationId: plan.publicationId,
+    designId: plan.designId,
+    version: plan.version,
+    copies: plan.copies,
+    gap: plan.gap,
+    totalSheets: plan.totalSheets,
+    totalPieces: plan.totalPieces,
+    colors,
+    shortage: plan.status === 'draft' ? totalShortage : 0,
+    feasible: plan.status !== 'draft' || totalShortage === 0,
     snapshotBound: true,
     createdAt: plan.createdAt,
     updatedAt: plan.updatedAt,

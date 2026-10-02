@@ -715,10 +715,12 @@ function switchTab(which) {
   document.getElementById('viewDiff').hidden = which !== 'diff';
   document.getElementById('viewPrint').hidden = which !== 'print';
   document.getElementById('viewProduction').hidden = which !== 'production';
+  document.getElementById('viewGlass').hidden = which !== 'glass';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
   if (which === 'production') enterProduction();
+  if (which === 'glass') enterGlass();
 }
 
 (async function init() {
@@ -956,6 +958,7 @@ function drawDiffSegments(list, kind, t, offsetPx) {
 
 document.getElementById('tabDiff').addEventListener('click', () => switchTab('diff'));
 document.getElementById('tabPrint').addEventListener('click', () => switchTab('print'));
+document.getElementById('tabGlass').addEventListener('click', () => switchTab('glass'));
 document.getElementById('diffDesignSelect').addEventListener('change', loadDiffVersions);
 document.getElementById('btnDiffRun').addEventListener('click', runDiff);
 
@@ -1633,3 +1636,439 @@ function renderPrintCanvas() {
 document.getElementById('printDesignSelect').addEventListener('change', loadPrintVersions);
 document.getElementById('btnPrintPreview').addEventListener('click', runPrintPreview);
 document.getElementById('btnPrintDownloadAll').addEventListener('click', downloadAllSvgs);
+
+// ================= 彩色玻璃原片裁片 =================
+
+const glass = {
+  materials: [],
+  plans: [],
+  detail: null,        // 当前展示的预览/裁片单
+  activeColor: null,   // 当前查看的颜色
+  activeSheet: 1,      // 当前查看的该色原片序号
+};
+
+function glassBanner(kind, msg) {
+  const b = document.getElementById('glassBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+  clearTimeout(glassBanner._t);
+  if (kind === 'success') glassBanner._t = setTimeout(() => { b.hidden = true; }, 3000);
+}
+
+async function enterGlass() {
+  glassBanner(false);
+  await Promise.all([loadGlassMaterials(), refreshGlassDesigns(), loadGlassPlans()]);
+}
+
+// ---------- 原片库存 ----------
+
+async function loadGlassMaterials() {
+  const data = await api('GET', '/api/glass-materials');
+  glass.materials = data.materials;
+  renderGlassMaterials();
+}
+
+function renderGlassMaterials() {
+  const el = document.getElementById('glassMatList');
+  if (!glass.materials.length) {
+    el.innerHTML = '<div class="hint">尚未登记原片。每种颜色登记一种原片规格（宽高 1–2000 mm）与库存张数。</div>';
+    return;
+  }
+  let html = '<table><thead><tr><th>颜色</th><th>规格 mm</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  for (const m of glass.materials) {
+    html += `<tr>
+      <td><span class="swatch" style="background:${m.color}"></span>
+        <span class="small">${escapeHtml(m.name || '')} <span class="muted">${m.color}</span></span></td>
+      <td class="num">${m.width} × ${m.height}</td>
+      <td class="num">${m.stock}</td>
+      <td class="num">${m.reserved}</td>
+      <td class="num"><b>${m.available}</b></td>
+      <td><input type="number" min="0" step="1" value="${m.stock}" class="glass-stock-edit" data-id="${m.id}" style="width:72px"></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+  el.querySelectorAll('.glass-stock-edit').forEach((inp) => {
+    inp.addEventListener('change', () => updateGlassStock(Number(inp.dataset.id), Number(inp.value), inp));
+  });
+}
+
+async function addGlassMaterial() {
+  const msg = document.getElementById('glassMatMsg');
+  const color = document.getElementById('glassColor').value;
+  const nameRaw = document.getElementById('glassName').value;
+  const width = Number(document.getElementById('glassWidth').value);
+  const height = Number(document.getElementById('glassHeight').value);
+  const stock = Number(document.getElementById('glassStock').value);
+  try {
+    await api('POST', '/api/glass-materials', {
+      color,
+      name: nameRaw.trim() || undefined,
+      width, height, stock,
+    });
+    document.getElementById('glassName').value = '';
+    msg.textContent = '✓ 已登记';
+    await loadGlassMaterials();
+  } catch (err) { msg.textContent = '⛔ ' + err.message; }
+}
+
+async function updateGlassStock(id, stock, inp) {
+  const msg = document.getElementById('glassMatMsg');
+  if (!Number.isInteger(stock) || stock < 0) {
+    msg.textContent = '⛔ 库存张数必须是非负整数，输入已忽略';
+    await loadGlassMaterials();
+    return;
+  }
+  try {
+    await api('PATCH', `/api/glass-materials/${id}`, { stock });
+    msg.textContent = '✓ 库存已更新（不得低于已预留数）';
+    await loadGlassMaterials();
+    await loadGlassPlans();
+  } catch (err) {
+    msg.textContent = '⛔ ' + err.message;
+    await loadGlassMaterials();
+  }
+}
+
+// ---------- 图纸 / 版本 ----------
+
+async function refreshGlassDesigns() {
+  const data = await api('GET', '/api/designs');
+  const sel = document.getElementById('glassDesignSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const d of data.designs) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = d.latest_version
+      ? `${d.name}（${d.width}×${d.height}mm · 最新 v${d.latest_version}）`
+      : `${d.name}（暂无发布版）`;
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  await loadGlassVersions();
+}
+
+async function loadGlassVersions() {
+  const sel = document.getElementById('glassVersionSelect');
+  sel.innerHTML = '';
+  const id = Number(document.getElementById('glassDesignSelect').value);
+  if (!id) { sel.innerHTML = '<option value="">（请先选择图纸）</option>'; return; }
+  const data = await api('GET', `/api/designs/${id}/publications`);
+  if (!data.publications.length) {
+    sel.innerHTML = '<option value="">（该图纸暂无发布版）</option>';
+    return;
+  }
+  for (const p of data.publications) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = `v${p.version} · ${p.publishedAt}`;
+    sel.appendChild(opt);
+  }
+}
+
+function glassInput() {
+  return {
+    publicationId: Number(document.getElementById('glassVersionSelect').value),
+    copies: Number(document.getElementById('glassCopies').value),
+    gap: Number(document.getElementById('glassGap').value),
+  };
+}
+
+// ---------- 预览 ----------
+
+async function previewGlass() {
+  const body = glassInput();
+  if (!body.publicationId) { showGlassHint('请先发布图纸，再选择发布版本。'); return; }
+  try {
+    const data = await api('POST', '/api/glass-plans/preview', body);
+    glass.detail = { kind: 'preview', value: data.preview };
+    const firstColor = data.preview.layout.colors[0];
+    glass.activeColor = firstColor ? firstColor.color : null;
+    glass.activeSheet = 1;
+    renderGlassDetail();
+    glassBanner(false);
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.code === 'piece_too_large') {
+      txt = `⛔ 单片无法放入原片：拼片 #${d.pieceNo}（件次 ${d.copy}）轮廓 ${d.pieceWidth}×${d.pieceHeight} mm，` +
+        `该色原片仅 ${d.sheetWidth}×${d.sheetHeight} mm——整单不排样`;
+    }
+    glassBanner('error', txt);
+    showGlassHint(txt.replace('⛔ ', ''));
+  }
+}
+
+function showGlassHint(text) {
+  document.getElementById('glassContent').innerHTML = `<div class="hint">${escapeHtml(text)}</div>`;
+}
+
+function renderGlassDetail() {
+  const det = glass.detail;
+  if (!det) return;
+  const isPreview = det.kind === 'preview';
+  const pv = det.value;
+  const L = pv.layout;
+  const root = document.getElementById('glassContent');
+  let html = '';
+
+  html += `<div class="plan-head">
+    <div><b>${isPreview ? '排样预览（不落库、不占库存）' : `裁片单 #${pv.id} · ${escapeHtml(pv.name)}`}</b></div>
+    <div class="muted">发布版 v${pv.version} · ${pv.copies} 件 · 片间最小间距 ${L.gap} mm ·
+      共 <b>${L.totalSheets}</b> 张原片（上限 60）· ${L.totalPieces} 个拼片</div></div>`;
+
+  // 库存结论
+  const shortageColors = L.colors.filter((c) => c.shortage > 0);
+  if (isPreview || pv.status === 'draft') {
+    if (shortageColors.length) {
+      html += `<div class="stock-badge bad">⚠ 库存缺口（不产生部分方案）：` +
+        shortageColors.map((c) => `${c.color} 缺 <b>${c.shortage}</b> 张`).join('；') + '</div>';
+    } else {
+      html += '<div class="stock-badge ok">✓ 各色原片库存充足（预览不占库存）</div>';
+    }
+  } else {
+    html += `<div class="stock-badge ${pv.status === 'confirmed' ? 'ok' : 'cancel'}">` +
+      (pv.status === 'confirmed' ? '✓ 已确认（所需各色原片已原子预留）' : '已取消（预留已释放）') + '</div>';
+  }
+
+  // 颜色/张数汇总
+  html += '<table><thead><tr><th>颜色</th><th>原片规格</th><th class="num">用板</th><th class="num">拼片</th>' +
+    '<th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
+  for (const c of L.colors) {
+    html += `<tr class="glass-color-row${c.color === glass.activeColor ? ' active' : ''}" data-color="${c.color}" style="cursor:pointer">
+      <td><span class="swatch" style="background:${c.color}"></span> ${escapeHtml(c.name || '')} <span class="muted">${c.color}</span></td>
+      <td class="num">${c.sheetWidth} × ${c.sheetHeight}</td>
+      <td class="num"><b>${c.usedSheets}</b></td>
+      <td class="num">${c.pieceCount}</td>
+      <td class="num">${c.stock ?? '—'}</td>
+      <td class="num">${c.reserved ?? '—'}</td>
+      <td class="num">${c.available}</td>
+      <td class="num">${c.shortage ? `<span class="gap-info"><b>${c.shortage}</b></span>` : '0'}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+
+  // 当前颜色的逐板画布 + 放置表
+  const cur = L.colors.find((c) => c.color === glass.activeColor) || L.colors[0];
+  if (cur) {
+    glass.activeColor = cur.color;
+    glass.activeSheet = Math.min(glass.activeSheet, cur.usedSheets);
+    html += '<div class="glass-sheet-bar btn-row">';
+    html += `<button id="glassPrevSheet">← 上一张</button>
+      <span><b>${cur.color}</b> 原片 <b>${glass.activeSheet}/${cur.usedSheets}</b>
+      （${cur.sheetWidth} × ${cur.sheetHeight} mm）</span>
+      <button id="glassNextSheet">下一张 →</button>`;
+    html += '</div>';
+    html += '<canvas id="glassCanvas" width="860" height="560"></canvas>';
+    const board = cur.boards.find((b) => b.index === glass.activeSheet);
+    html += '<table><thead><tr><th>片号</th><th>件次</th><th class="num">旋转</th>' +
+      '<th class="num">放置坐标 (x,y)</th><th>轮廓 [[x,y],…]（原片坐标 mm）</th></tr></thead><tbody>';
+    for (const p of board.placements) {
+      html += `<tr><td><span class="swatch" style="background:${cur.color}"></span> #${p.pieceNo}</td>
+        <td>第 ${p.copy} 件</td>
+        <td class="num">${p.rotation}°</td>
+        <td class="num">(${p.x}, ${p.y})</td>
+        <td class="small muted">${JSON.stringify(p.polygon)}</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+
+  // 操作
+  if (isPreview) {
+    html += '<div class="btn-row"><button id="btnGlassSave" class="primary">存为草稿裁片单</button></div>';
+  } else if (pv.status === 'draft') {
+    html += `<div class="btn-row">
+      <button id="btnGlassConfirm" class="primary">确认裁片单（原子预留所有颜色）</button>
+      <button id="btnGlassDelete" class="danger">删除草稿</button></div>`;
+  } else if (pv.status === 'confirmed') {
+    html += '<div class="btn-row"><button id="btnGlassCancel" class="danger">取消裁片单（整单释放一次）</button></div>';
+  }
+
+  root.innerHTML = html;
+
+  root.querySelectorAll('.glass-color-row').forEach((tr) => {
+    tr.addEventListener('click', () => {
+      glass.activeColor = tr.dataset.color;
+      glass.activeSheet = 1;
+      renderGlassDetail();
+    });
+  });
+  const prev = document.getElementById('glassPrevSheet');
+  if (prev) prev.addEventListener('click', () => { glass.activeSheet = Math.max(1, glass.activeSheet - 1); renderGlassDetail(); });
+  const next = document.getElementById('glassNextSheet');
+  if (next) next.addEventListener('click', () => {
+    const c = L.colors.find((x) => x.color === glass.activeColor);
+    glass.activeSheet = Math.min(c.usedSheets, glass.activeSheet + 1);
+    renderGlassDetail();
+  });
+  const save = document.getElementById('btnGlassSave');
+  if (save) save.addEventListener('click', saveGlassDraft);
+  const cf = document.getElementById('btnGlassConfirm');
+  if (cf) cf.addEventListener('click', () => confirmGlass(pv.id));
+  const de = document.getElementById('btnGlassDelete');
+  if (de) de.addEventListener('click', () => deleteGlass(pv.id));
+  const ca = document.getElementById('btnGlassCancel');
+  if (ca) ca.addEventListener('click', () => cancelGlass(pv.id));
+
+  drawGlassSheet(cur);
+}
+
+// 在画布上绘制当前原片与放置片（原片坐标 y 向上，画布 y 向下）
+function drawGlassSheet(cur) {
+  const cv = document.getElementById('glassCanvas');
+  if (!cv || !cur) return;
+  const cx = cv.getContext('2d');
+  cx.clearRect(0, 0, cv.width, cv.height);
+  const pad = 40;
+  const scale = Math.min((cv.width - pad * 2) / cur.sheetWidth, (cv.height - pad * 2) / cur.sheetHeight);
+  const ox = (cv.width - cur.sheetWidth * scale) / 2;
+  const oy = (cv.height - cur.sheetHeight * scale) / 2;
+  const toPx = (x, y) => [ox + x * scale, cv.height - (oy + y * scale)];
+
+  // 原片底板
+  cx.fillStyle = '#f4f1e8';
+  cx.fillRect(...toPx(0, cur.sheetHeight), cur.sheetWidth * scale, cur.sheetHeight * scale);
+  cx.strokeStyle = '#8a7d5f';
+  cx.lineWidth = 2.5;
+  cx.strokeRect(...toPx(0, cur.sheetHeight), cur.sheetWidth * scale, cur.sheetHeight * scale);
+
+  const board = cur.boards.find((b) => b.index === glass.activeSheet);
+  for (const p of board.placements) {
+    const pts = p.polygon.map(([x, y]) => toPx(x, y));
+    cx.beginPath();
+    cx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) cx.lineTo(pts[i][0], pts[i][1]);
+    cx.closePath();
+    cx.fillStyle = cur.color;
+    cx.globalAlpha = 0.8;
+    cx.fill();
+    cx.globalAlpha = 1;
+    cx.strokeStyle = '#222';
+    cx.lineWidth = 1.4;
+    cx.stroke();
+    const [ccx0, ccy0] = centroid(p.polygon);
+    const [px, py] = toPx(ccx0, ccy0);
+    cx.font = 'bold 13px sans-serif';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    const label = `#${p.pieceNo}·${p.copy}件`;
+    const w = cx.measureText(label).width;
+    cx.fillStyle = 'rgba(255,255,255,0.78)';
+    cx.fillRect(px - w / 2 - 4, py - 9, w + 8, 18);
+    cx.fillStyle = '#111';
+    cx.fillText(label, px, py);
+  }
+
+  cx.fillStyle = '#666';
+  cx.font = '12px sans-serif';
+  cx.textAlign = 'center';
+  cx.fillText(`原片 ${cur.sheetWidth} mm`, ox + cur.sheetWidth * scale / 2, cv.height - 8);
+  cx.save();
+  cx.translate(12, oy + cur.sheetHeight * scale / 2);
+  cx.rotate(-Math.PI / 2);
+  cx.fillText(`${cur.sheetHeight} mm`, 0, 0);
+  cx.restore();
+}
+
+// ---------- 草稿 / 确认 / 取消 / 删除 ----------
+
+async function saveGlassDraft() {
+  const pv = glass.detail.value;
+  const name = document.getElementById('glassPlanName').value;
+  try {
+    const data = await api('POST', '/api/glass-plans', {
+      name: name || undefined,
+      publicationId: pv.publicationId,
+      copies: pv.copies,
+      gap: pv.gap,
+    });
+    glassBanner('success', `✓ 已存为草稿裁片单 #${data.plan.id}（尚未占用库存）`);
+    await loadGlassPlans(data.plan.id);
+  } catch (err) { glassBanner('error', '⛔ ' + err.message); }
+}
+
+async function confirmGlass(id) {
+  try {
+    const data = await api('POST', `/api/glass-plans/${id}/confirm`);
+    glassBanner('success', `✓ 裁片单 #${id} 已确认，共预留 ${data.plan.totalSheets} 张原片`);
+    await loadGlassMaterials();
+    await loadGlassPlans(id);
+  } catch (err) {
+    glassBanner('error', '⛔ ' + (err.data?.error || err.message));
+    await loadGlassMaterials();
+    await loadGlassPlans(id);
+  }
+}
+
+async function cancelGlass(id) {
+  if (!confirm(`确定取消裁片单 #${id}？该单所有颜色的预留张数将整单释放（仅释放一次）。`)) return;
+  try {
+    await api('POST', `/api/glass-plans/${id}/cancel`);
+    glassBanner('success', `裁片单 #${id} 已取消，预留已整单释放`);
+    await loadGlassMaterials();
+    await loadGlassPlans(id);
+  } catch (err) { glassBanner('error', '⛔ ' + err.message); await loadGlassPlans(id); }
+}
+
+async function deleteGlass(id) {
+  if (!confirm(`确定删除草稿裁片单 #${id}？`)) return;
+  try {
+    await api('DELETE', `/api/glass-plans/${id}`);
+    glassBanner('success', `草稿 #${id} 已删除`);
+    await loadGlassPlans();
+  } catch (err) { glassBanner('error', '⛔ ' + err.message); }
+}
+
+async function loadGlassPlans(selectId) {
+  const data = await api('GET', '/api/glass-plans');
+  glass.plans = data.plans;
+  renderGlassPlanList();
+  if (selectId) {
+    const p = glass.plans.find((x) => x.id === selectId);
+    if (p) {
+      glass.detail = { kind: 'plan', value: p };
+      glass.activeColor = p.colors[0] ? p.colors[0].color : null;
+      glass.activeSheet = 1;
+      renderGlassDetail();
+    }
+  }
+}
+
+function renderGlassPlanList() {
+  const el = document.getElementById('glassPlanList');
+  if (!glass.plans.length) {
+    el.innerHTML = '<div class="hint">暂无裁片单。</div>';
+    return;
+  }
+  el.innerHTML = glass.plans.map((p) => {
+    const badge = p.status === 'confirmed'
+      ? '<span class="badge ok">已确认</span>'
+      : p.status === 'canceled'
+        ? '<span class="badge bad" style="background:#eee;color:#888">已取消</span>'
+        : '<span class="badge bad">草稿</span>';
+    const warn = p.status === 'draft' && p.shortage > 0
+      ? ` <span class="gap-info">缺 ${p.shortage} 张</span>` : '';
+    return `<div class="plan-item" data-id="${p.id}">
+      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}</div>
+      <div class="muted small">v${p.version} · ${p.copies}件 · 间距 ${p.gap}mm ·
+        共 ${p.totalSheets} 张 · ${p.colors.map((c) =>
+          `<span class="swatch" style="background:${c.color};width:10px;height:10px"></span>${c.usedSheets}`).join(' / ')}</div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.plan-item').forEach((div) => {
+    div.addEventListener('click', () => {
+      const p = glass.plans.find((x) => x.id === Number(div.dataset.id));
+      glass.detail = { kind: 'plan', value: p };
+      glass.activeColor = p.colors[0] ? p.colors[0].color : null;
+      glass.activeSheet = 1;
+      renderGlassDetail();
+    });
+  });
+}
+
+document.getElementById('btnGlassAdd').addEventListener('click', addGlassMaterial);
+document.getElementById('glassDesignSelect').addEventListener('change', loadGlassVersions);
+document.getElementById('btnGlassPreview').addEventListener('click', previewGlass);

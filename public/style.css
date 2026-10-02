@@ -238,3 +238,9 @@ td.added.num, th.added.num { color: #2e7d4f; }
 .print-page-item:hover { background: #f2efe7; }
 .print-page-item.active { border-color: var(--primary); background: #eef3fa; }
 .print-page-item .icon-btn { position: absolute; right: 8px; top: 8px; }
+
+/* ---------- 原片裁片 ---------- */
+.glass-color-row.active { background: #eef3fa; font-weight: 600; }
+.glass-color-row:hover { background: #f2efe7; }
+.glass-sheet-bar { align-items: center; margin: 12px 0 6px; }
+#glassCanvas { cursor: default; }
